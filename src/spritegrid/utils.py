@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.spatial.distance import cdist, euclidean
 from PIL import Image
 
 
@@ -26,6 +25,87 @@ def convert_image_to_ascii(
     return "".join(strings)
 
 
+def convert_image_to_halfblock(
+    image: Image.Image,
+    alpha_threshold: int = 64,
+    use_256_colors: bool = False,
+) -> str:
+    """Convert image to ANSI half-block art.
+
+    Uses ▀ (upper half block) where each character represents 2 vertical pixels.
+    Foreground color = top pixel, background color = bottom pixel.
+
+    Args:
+        image: PIL Image (will be converted to RGBA)
+        alpha_threshold: Alpha values >= this are visible (default 64 = 25%)
+        use_256_colors: Use 256-color mode instead of truecolor (for compatibility)
+
+    Returns:
+        String with ANSI escape codes for terminal display
+    """
+    image = image.convert('RGBA')
+    width, height = image.size
+    pixels = image.load()
+
+    # Ensure even height
+    if height % 2 != 0:
+        height -= 1
+
+    lines = []
+    for y in range(0, height, 2):
+        line = []
+        for x in range(width):
+            # Top pixel
+            r1, g1, b1, a1 = pixels[x, y]
+            # Bottom pixel
+            r2, g2, b2, a2 = pixels[x, y + 1] if y + 1 < image.height else (0, 0, 0, 0)
+
+            # Apply alpha threshold
+            top_visible = a1 >= alpha_threshold
+            bot_visible = a2 >= alpha_threshold
+
+            if use_256_colors:
+                fg1 = _rgb_to_256(r1, g1, b1)
+                fg2 = _rgb_to_256(r2, g2, b2)
+                fg_code = lambda c: f"\x1b[38;5;{c}m"
+                bg_code = lambda c: f"\x1b[48;5;{c}m"
+            else:
+                fg_code = lambda rgb: f"\x1b[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+                bg_code = lambda rgb: f"\x1b[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+                fg1, fg2 = (r1, g1, b1), (r2, g2, b2)
+
+            if top_visible and bot_visible:
+                # Both visible: ▀ with fg=top, bg=bottom
+                line.append(f"{fg_code(fg1)}{bg_code(fg2)}▀\x1b[0m")
+            elif top_visible:
+                # Only top: ▀ with fg=top
+                line.append(f"{fg_code(fg1)}▀\x1b[0m")
+            elif bot_visible:
+                # Only bottom: ▄ with fg=bottom
+                line.append(f"{fg_code(fg2)}▄\x1b[0m")
+            else:
+                # Both transparent: space
+                line.append(" ")
+        lines.append("".join(line))
+
+    return "\n".join(lines)
+
+
+def _rgb_to_256(r: int, g: int, b: int) -> int:
+    """Convert RGB to nearest ANSI 256 color."""
+    # Check grayscale
+    if abs(r - g) < 10 and abs(g - b) < 10:
+        gray = (r + g + b) // 3
+        if gray < 8:
+            return 16
+        if gray > 248:
+            return 231
+        return round((gray - 8) / 247 * 24) + 232
+
+    # Color cube: 6x6x6
+    return 16 + 36 * round(r / 255 * 5) + 6 * round(g / 255 * 5) + round(b / 255 * 5)
+
+
 def naive_median(X: np.ndarray) -> np.ndarray:
     """
     Returns the naive median of points in X.
@@ -47,6 +127,8 @@ def geometric_median(X: np.ndarray, eps: float = 1e-5) -> np.ndarray:
     https://stackoverflow.com/questions/30299267/geometric-median-of-multidimensional-points
 
     """
+    from scipy.spatial.distance import cdist, euclidean
+
     y = np.mean(X, 0)
 
     while True:
@@ -110,3 +192,54 @@ def crop_to_content(image: Image.Image) -> Image.Image:
     cropped_image = image.crop((min_x, min_y, max_x + 1, max_y + 1))
 
     return cropped_image
+
+
+def quantize_image(
+    image: Image.Image,
+    color_bits: int = 8,
+    alpha_bits: int = 8,
+    alpha_threshold: int = None,
+    num_colors: int = None,
+) -> Image.Image:
+    """
+    Quantize image colors and/or alpha channel.
+
+    Args:
+        image: PIL Image (will be converted to RGBA)
+        color_bits: Bit depth per color channel (1-8). 8 = no change, 4 = 16 levels, etc.
+        alpha_bits: Bit depth for alpha channel (1-8). 8 = no change.
+        alpha_threshold: If set, binary alpha: >= threshold becomes 255, < threshold becomes 0
+        num_colors: If set, use palette quantization to reduce to N colors (ignores color_bits)
+
+    Returns:
+        Quantized PIL Image in RGBA mode
+    """
+    image = image.convert('RGBA')
+    arr = np.array(image, dtype=np.float32)
+
+    # Palette-based quantization
+    if num_colors is not None:
+        # Use PIL's built-in quantization for palette reduction
+        rgb = image.convert('RGB')
+        quantized_rgb = rgb.quantize(colors=num_colors, method=Image.Quantize.MEDIANCUT)
+        quantized_rgb = quantized_rgb.convert('RGB')
+        # Restore alpha from original
+        result = Image.merge('RGBA', (*quantized_rgb.split(), image.split()[3]))
+        arr = np.array(result, dtype=np.float32)
+
+    # Bit-depth quantization for colors
+    if color_bits < 8 and num_colors is None:
+        max_val = 2 ** color_bits - 1
+        for c in range(3):  # RGB channels only
+            arr[:, :, c] = np.round(arr[:, :, c] * max_val / 255) * 255 / max_val
+
+    # Alpha processing
+    if alpha_threshold is not None:
+        # Binary alpha based on threshold
+        arr[:, :, 3] = np.where(arr[:, :, 3] >= alpha_threshold, 255, 0)
+    elif alpha_bits < 8:
+        # Bit-depth quantization for alpha
+        max_val = 2 ** alpha_bits - 1
+        arr[:, :, 3] = np.round(arr[:, :, 3] * max_val / 255) * 255 / max_val
+
+    return Image.fromarray(arr.astype(np.uint8), mode='RGBA')
